@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Calculator, DollarSign, Percent, AlertCircle, Shield, ArrowUpCircle, ArrowDownCircle } from 'lucide-react';
+import { Calculator, DollarSign, Percent, AlertCircle, Shield, ArrowUpCircle, ArrowDownCircle, Layers } from 'lucide-react';
 import { PositionSizeInputs, PositionSizeResult } from '../types';
 
 interface Props {
@@ -15,6 +15,8 @@ interface StopBatch {
   riskPercentR: number;
 }
 
+type StrategyType = '2-STOP' | '3-STOP';
+
 const PositionCalculator: React.FC<Props> = ({ onCalculationChange }) => {
   const [inputs, setInputs] = useState<PositionSizeInputs>({
     accountSize: 10000,
@@ -22,6 +24,8 @@ const PositionCalculator: React.FC<Props> = ({ onCalculationChange }) => {
     entryPrice: 0,
     stopLossPrice: 0,
   });
+
+  const [strategyType, setStrategyType] = useState<StrategyType>('3-STOP');
 
   const [result, setResult] = useState<PositionSizeResult>({
     shares: 0,
@@ -41,7 +45,7 @@ const PositionCalculator: React.FC<Props> = ({ onCalculationChange }) => {
   useEffect(() => {
     calculate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [inputs]);
+  }, [inputs, strategyType]);
 
   const calculate = () => {
     const { accountSize, riskPercentage, entryPrice, stopLossPrice } = inputs;
@@ -69,42 +73,61 @@ const PositionCalculator: React.FC<Props> = ({ onCalculationChange }) => {
 
     setResult(newResult);
     
-    // --- INTEGRATED 3-STOP STRATEGY CALCULATION ---
+    // --- INTEGRATED STOP STRATEGY CALCULATION ---
     if (shares > 0) {
       const isLong = entryPrice > stopLossPrice;
       const direction = isLong ? 'LONG' : 'SHORT';
       const riskDist = riskPerShare;
-
-      // Batch sizes
-      const batchSize = Math.floor(shares / 3);
-      const remainder = shares - (batchSize * 2);
-
-      // Stop Prices
-      // Long: Entry - Dist. Short: Entry + Dist.
       const dirMult = isLong ? -1 : 1;
-      
-      const stop1Price = entryPrice + (dirMult * (riskDist * (1/3)));
-      const stop2Price = entryPrice + (dirMult * (riskDist * (2/3)));
-      const stop3Price = stopLossPrice; // Full 1R
 
-      // Risk per batch
-      const loss1 = Math.abs(entryPrice - stop1Price) * batchSize;
-      const loss2 = Math.abs(entryPrice - stop2Price) * batchSize;
-      const loss3 = Math.abs(entryPrice - stop3Price) * remainder;
-      
-      const totalPotentialLoss = loss1 + loss2 + loss3;
-      const avgLossPerShare = totalPotentialLoss / shares;
-      const blendedStop = entryPrice + (dirMult * avgLossPerShare);
+      let batches: StopBatch[] = [];
+      let totalPotentialLoss = 0;
+
+      if (strategyType === '3-STOP') {
+        const batchSize = Math.floor(shares / 3);
+        const remainder = shares - (batchSize * 2);
+
+        const stop1Price = entryPrice + (dirMult * (riskDist * (1/3)));
+        const stop2Price = entryPrice + (dirMult * (riskDist * (2/3)));
+        const stop3Price = stopLossPrice; // Full 1R
+
+        const loss1 = Math.abs(entryPrice - stop1Price) * batchSize;
+        const loss2 = Math.abs(entryPrice - stop2Price) * batchSize;
+        const loss3 = Math.abs(entryPrice - stop3Price) * remainder;
+        
+        totalPotentialLoss = loss1 + loss2 + loss3;
+        
+        batches = [
+          { id: 1, label: 'Early Stop (33%)', shares: batchSize, price: stop1Price, riskAmount: loss1, riskPercentR: loss1/riskAmount },
+          { id: 2, label: 'Mid Stop (66%)', shares: batchSize, price: stop2Price, riskAmount: loss2, riskPercentR: loss2/riskAmount },
+          { id: 3, label: 'Final Stop (LoD)', shares: remainder, price: stop3Price, riskAmount: loss3, riskPercentR: loss3/riskAmount },
+        ];
+      } else {
+        // 2-STOP STRATEGY
+        const batchSize = Math.floor(shares / 2);
+        const remainder = shares - batchSize;
+
+        const stop1Price = entryPrice + (dirMult * (riskDist * 0.5));
+        const stop2Price = stopLossPrice; // Full 1R
+
+        const loss1 = Math.abs(entryPrice - stop1Price) * batchSize;
+        const loss2 = Math.abs(entryPrice - stop2Price) * remainder;
+
+        totalPotentialLoss = loss1 + loss2;
+
+        batches = [
+          { id: 1, label: 'Half Stop (50%)', shares: batchSize, price: stop1Price, riskAmount: loss1, riskPercentR: loss1/riskAmount },
+          { id: 2, label: 'Final Stop (LoD)', shares: remainder, price: stop2Price, riskAmount: loss2, riskPercentR: loss2/riskAmount },
+        ];
+      }
+
+      const blendedStop = entryPrice + (dirMult * (totalPotentialLoss / shares));
 
       setStrategyData({
         direction,
         blendedStop,
         effectiveRisk: totalPotentialLoss,
-        batches: [
-          { id: 1, label: 'Early Stop (33%)', shares: batchSize, price: stop1Price, riskAmount: loss1, riskPercentR: loss1/riskAmount },
-          { id: 2, label: 'Mid Stop (66%)', shares: batchSize, price: stop2Price, riskAmount: loss2, riskPercentR: loss2/riskAmount },
-          { id: 3, label: 'Final Stop (LoD)', shares: remainder, price: stop3Price, riskAmount: loss3, riskPercentR: loss3/riskAmount },
-        ]
+        batches
       });
     } else {
       setStrategyData(null);
@@ -118,24 +141,15 @@ const PositionCalculator: React.FC<Props> = ({ onCalculationChange }) => {
     setInputs(prev => ({ ...prev, [name]: parseFloat(value) || 0 }));
   };
 
-  // Helper to generate scenario data
   const getScenario = (riskPct: number) => {
     if (!result.isValid || inputs.entryPrice <= 0) return null;
-    
     const riskAmount = inputs.accountSize * (riskPct / 100);
     const riskPerShare = Math.abs(inputs.entryPrice - inputs.stopLossPrice);
     const shares = Math.floor(riskAmount / riskPerShare);
     const positionValue = shares * inputs.entryPrice;
-    
-    return {
-      riskPct,
-      shares,
-      positionValue,
-      riskAmount
-    };
+    return { riskPct, shares, positionValue, riskAmount };
   };
 
-  // Generate scenarios
   const baseScenarios = [0.25, 0.33, 0.5, 0.66, 0.75, 1.0, 1.5];
   const scenarios = [...new Set([...baseScenarios, inputs.riskPercentage])]
     .sort((a, b) => a - b)
@@ -144,9 +158,26 @@ const PositionCalculator: React.FC<Props> = ({ onCalculationChange }) => {
   return (
     <div className="space-y-6">
       <div className="bg-slate-800 rounded-xl p-6 shadow-lg border border-slate-700">
-        <div className="flex items-center gap-2 mb-6 text-emerald-400">
-          <Calculator size={24} />
-          <h2 className="text-xl font-bold text-white">Position Calculator</h2>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+            <div className="flex items-center gap-2 text-emerald-400">
+                <Calculator size={24} />
+                <h2 className="text-xl font-bold text-white">Position Calculator</h2>
+            </div>
+            
+            <div className="flex bg-slate-900 p-1 rounded-lg border border-slate-700">
+                <button 
+                    onClick={() => setStrategyType('3-STOP')}
+                    className={`px-3 py-1 text-xs font-bold rounded transition-all flex items-center gap-1 ${strategyType === '3-STOP' ? 'bg-emerald-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}
+                >
+                    <Layers size={12} /> 3-Stop
+                </button>
+                <button 
+                    onClick={() => setStrategyType('2-STOP')}
+                    className={`px-3 py-1 text-xs font-bold rounded transition-all flex items-center gap-1 ${strategyType === '2-STOP' ? 'bg-emerald-600 text-white shadow' : 'text-slate-400 hover:text-white'}`}
+                >
+                    <Layers size={12} /> 2-Stop
+                </button>
+            </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -266,7 +297,7 @@ const PositionCalculator: React.FC<Props> = ({ onCalculationChange }) => {
             <div className="mt-8 pt-6 border-t border-slate-700">
                  <div className="flex items-center gap-2 mb-4">
                     <Shield className="text-cyan-400" size={20} />
-                    <h3 className="text-md font-bold text-white uppercase tracking-wider">Strategy Execution Plan</h3>
+                    <h3 className="text-md font-bold text-white uppercase tracking-wider">Strategy Execution ({strategyType === '3-STOP' ? '3-Stop' : '2-Stop'})</h3>
                  </div>
 
                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
